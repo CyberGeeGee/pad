@@ -16,6 +16,7 @@ input,button,textarea{font:inherit;color:inherit;background:var(--bg);border:1px
 <textarea id=t disabled spellcheck=false autocomplete=off></textarea>
 <script>
 const $=id=>document.getElementById(id), L=localStorage, enc=new TextEncoder(), dec=new TextDecoder();
+const BLANK='(empty)'; // gists reject blank/whitespace-only content; any non-encrypted text reads as an empty pad
 const st=m=>{$('st').textContent=m};
 $('tok').value=L.tok||''; $('gid').value=L.gid||'';
 
@@ -93,7 +94,7 @@ $('wipe').onclick=async()=>{
   clearTimeout(timer); busy=true;
   try{
     const r=await fetch(api,{method:'PATCH',headers:{...H(),'Content-Type':'application/json'},
-      body:JSON.stringify({files:{'pad.txt':{content:' '}}})});   // gists reject empty content
+      body:JSON.stringify({files:{'pad.txt':{content:BLANK}}})});   // placeholder text, since gists reject blank content
     if(r.ok){ $('t').value=''; synced=''; etag=null; key=salt=null; unlocked=true; st('wiped'); }
     else st('wipe '+r.status);
   }catch{ st('wipe failed'); }
@@ -108,7 +109,7 @@ $('destroy').onclick=async()=>{
     let r=await fetch(api,{method:'DELETE',headers:H()});
     if(!r.ok){ st('delete '+r.status); busy=false; poll=setInterval(pull,2000); return; }
     r=await fetch('https://api.github.com/gists',{method:'POST',headers:{...H(),'Content-Type':'application/json'},
-      body:JSON.stringify({public:false,description:'pad',files:{'pad.txt':{content:' '}}})});
+      body:JSON.stringify({public:false,description:'pad',files:{'pad.txt':{content:BLANK}}})});
     if(!r.ok){ st('old gist deleted, but creating a new one failed ('+r.status+')'); busy=false; return; }
     const id=(await r.json()).id;
     L.gid=id; $('gid').value=id; api='https://api.github.com/gists/'+id;
@@ -119,4 +120,3 @@ $('destroy').onclick=async()=>{
   busy=false;
 };
 </script>
- 
