@@ -1,0 +1,35 @@
+<!doctype html><meta charset=utf-8><title>pad</title>
+<style>body{margin:0;font:14px monospace}#bar{padding:6px;display:flex;gap:6px}
+#t{width:100%;height:calc(100vh - 40px);box-sizing:border-box}</style>
+<div id=bar><input id=tok type=password placeholder=token><input id=gid placeholder="gist id">
+<button id=save>save</button><span id=st></span></div>
+<textarea id=t></textarea>
+<script>
+const $=id=>document.getElementById(id), L=localStorage;
+$('tok').value=L.tok||''; $('gid').value=L.gid||'';
+$('save').onclick=()=>{L.tok=$('tok').value; L.gid=$('gid').value; location.reload()};
+const api='https://api.github.com/gists/'+L.gid;
+const H=()=>({Authorization:'Bearer '+L.tok, Accept:'application/vnd.github+json'});
+let etag=null, synced='', timer=null, busy=false;
+
+async function pull(){
+  if(!L.tok||!L.gid||busy) return;
+  const h=H(); if(etag) h['If-None-Match']=etag;
+  const r=await fetch(api,{headers:h,cache:'no-store'});
+  if(r.status===304) return;                       // unchanged (free against rate limit)
+  if(!r.ok){ $('st').textContent='pull '+r.status; return; }
+  etag=r.headers.get('ETag');
+  const v=(await r.json()).files['pad.txt']?.content||'';
+  if($('t').value===synced) $('t').value=v;        // don't clobber unsent local edits
+  synced=v; $('st').textContent='ok';
+}
+async function push(){
+  busy=true; const v=$('t').value;
+  const r=await fetch(api,{method:'PATCH',headers:{...H(),'Content-Type':'application/json'},
+    body:JSON.stringify({files:{'pad.txt':{content:v||' '}}})});
+  if(r.ok){ synced=v; etag=null; } else $('st').textContent='push '+r.status;
+  busy=false;
+}
+$('t').oninput=()=>{ clearTimeout(timer); timer=setTimeout(push,600); };
+pull(); setInterval(pull,2000);
+</script>
