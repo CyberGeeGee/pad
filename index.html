@@ -1,36 +1,102 @@
-<!doctype html><meta charset=utf-8><title>pad</title>
-<style>body{margin:0;font:14px monospace}#bar{padding:6px;display:flex;gap:6px}
-#t{width:100%;height:calc(100vh - 40px);box-sizing:border-box}</style>
-<div id=bar><input id=tok type=password placeholder=token><input id=gid placeholder="gist id">
-<button id=save>save</button><span id=st></span></div>
-<textarea id=t></textarea>
+<!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>pad</title>
+<style>
+:root{--bg:#fff;--fg:#111;--bd:#bbb}
+@media(prefers-color-scheme:dark){:root{--bg:#161616;--fg:#e8e8e8;--bd:#444}}
+body{margin:0;font:14px system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+#bar{padding:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+input,button,textarea{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--bd);padding:4px 6px}
+#t{display:block;width:100%;height:calc(100vh - 76px);box-sizing:border-box;border-width:1px 0 0;font:14px ui-monospace,monospace}
+</style>
+<div id=bar>
+<input id=tok type=password placeholder=token autocomplete=off>
+<input id=gid placeholder="gist id" autocomplete=off>
+<input id=pw type=password placeholder=passphrase autocomplete=off>
+<button id=go>connect</button><button id=wipe>wipe</button><span id=st></span>
+</div>
+<textarea id=t disabled spellcheck=false autocomplete=off></textarea>
 <script>
-const $=id=>document.getElementById(id), L=localStorage;
+const $=id=>document.getElementById(id), L=localStorage, enc=new TextEncoder(), dec=new TextDecoder();
+const st=m=>{$('st').textContent=m};
 $('tok').value=L.tok||''; $('gid').value=L.gid||'';
-$('save').onclick=()=>{L.tok=$('tok').value; L.gid=$('gid').value; location.reload()};
-const api='https://api.github.com/gists/'+L.gid;
+
+const b64=u=>{let s='';for(let i=0;i<u.length;i+=8192)s+=String.fromCharCode.apply(null,u.subarray(i,i+8192));return btoa(s)};
+const unb64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+
+let api='', pw='', key=null, salt=null, unlocked=false, etag=null, synced='', timer=null, busy=false, poll=null;
 const H=()=>({Authorization:'Bearer '+L.tok, Accept:'application/vnd.github+json'});
-let etag=null, synced='', timer=null, busy=false;
+
+// passphrase -> AES-GCM key (PBKDF2-SHA256). Passphrase lives in memory only.
+async function derive(s){
+  const base=await crypto.subtle.importKey('raw',enc.encode(pw),'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',salt:s,iterations:310000,hash:'SHA-256'},
+    base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+// payload = "v1:" + base64(salt16 | iv12 | ciphertext)
+async function encrypt(txt){
+  if(!key){ salt=crypto.getRandomValues(new Uint8Array(16)); key=await derive(salt); }
+  const iv=crypto.getRandomValues(new Uint8Array(12));
+  const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},key,enc.encode(txt)));
+  const out=new Uint8Array(28+ct.length); out.set(salt); out.set(iv,16); out.set(ct,28);
+  return 'v1:'+b64(out);
+}
+async function decrypt(s){
+  const u=unb64(s.slice(3)), sl=u.slice(0,16);
+  if(!salt||b64(sl)!==b64(salt)){ key=await derive(sl); salt=sl; }
+  return dec.decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:u.slice(16,28)},key,u.slice(28)));
+}
 
 async function pull(){
-  if(!L.tok||!L.gid||busy) return;
-  const h=H(); if(etag) h['If-None-Match']=etag;
-  const r=await fetch(api,{headers:h,cache:'no-store'});
-  if(r.status===304) return;                       // unchanged (free against rate limit)
-  if(!r.ok){ $('st').textContent='pull '+r.status; return; }
-  etag=r.headers.get('ETag');
-  const v=(await r.json()).files['pad.txt']?.content||'';
-  if($('t').value===synced) $('t').value=v;        // don't clobber unsent local edits
-  synced=v; $('st').textContent='ok';
+  if(busy) return;
+  try{
+    const h=H(); if(etag) h['If-None-Match']=etag;
+    const r=await fetch(api,{headers:h,cache:'no-store'});
+    if(r.status===304) return;
+    if(!r.ok){ st('pull '+r.status); return; }
+    etag=r.headers.get('ETag');
+    const c=(await r.json()).files['pad.txt']?.content||'';
+    let v='';
+    if(c.startsWith('v1:')){
+      try{ v=await decrypt(c); unlocked=true; }
+      catch{ st('wrong passphrase'); $('t').disabled=true; return; }
+    } else { unlocked=true; }           // blank or placeholder gist: first push sets the passphrase
+    if($('t').value===synced) $('t').value=v;   // don't clobber unsent local edits
+    synced=v; $('t').disabled=false; st('ok');
+  }catch{ st('pull failed'); }
 }
+
 async function push(){
+  if(!unlocked) return;
   busy=true; const v=$('t').value;
-  const r=await fetch(api,{method:'PATCH',headers:{...H(),'Content-Type':'application/json'},
-    body:JSON.stringify({files:{'pad.txt':{content:v||' '}}})});
-  if(r.ok){ synced=v; etag=null; } else $('st').textContent='push '+r.status;
+  try{
+    const r=await fetch(api,{method:'PATCH',headers:{...H(),'Content-Type':'application/json'},
+      body:JSON.stringify({files:{'pad.txt':{content:await encrypt(v)}}})});
+    if(r.ok){ synced=v; etag=null; st('ok'); } else st('push '+r.status);
+  }catch{ st('push failed'); }
   busy=false;
 }
+
 $('t').oninput=()=>{ clearTimeout(timer); timer=setTimeout(push,600); };
-pull(); setInterval(pull,2000);
+
+$('go').onclick=()=>{
+  L.tok=$('tok').value.trim(); L.gid=$('gid').value.trim(); pw=$('pw').value;
+  if(!L.tok||!L.gid||!pw){ st('need token, gist id, passphrase'); return; }
+  $('pw').value='';
+  clearInterval(poll); clearTimeout(timer);
+  key=salt=null; unlocked=false; etag=null; synced=''; $('t').value=''; busy=false;
+  api='https://api.github.com/gists/'+L.gid;
+  st('connecting'); pull(); poll=setInterval(pull,2000);
+};
+$('pw').onkeydown=e=>{ if(e.key==='Enter') $('go').click(); };
+
+$('wipe').onclick=async()=>{
+  if(!api||!confirm('Blank the gist and clear the pad?')) return;
+  clearTimeout(timer); busy=true;
+  try{
+    const r=await fetch(api,{method:'PATCH',headers:{...H(),'Content-Type':'application/json'},
+      body:JSON.stringify({files:{'pad.txt':{content:' '}}})});   // gists reject empty content
+    if(r.ok){ $('t').value=''; synced=''; etag=null; key=salt=null; unlocked=true; st('wiped'); }
+    else st('wipe '+r.status);
+  }catch{ st('wipe failed'); }
+  busy=false;
+};
 </script>
- 
