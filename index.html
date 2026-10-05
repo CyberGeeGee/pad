@@ -11,7 +11,7 @@ input,button,textarea{font:inherit;color:inherit;background:var(--bg);border:1px
 <input id=tok type=password placeholder=token autocomplete=off>
 <input id=gid placeholder="gist id" autocomplete=off>
 <input id=pw type=password placeholder=passphrase autocomplete=off>
-<button id=go>connect</button><button id=wipe>wipe</button><span id=st></span>
+<button id=go>connect</button><button id=wipe>wipe</button><button id=destroy>destroy</button><span id=st></span>
 </div>
 <textarea id=t disabled spellcheck=false autocomplete=off></textarea>
 <script>
@@ -51,7 +51,7 @@ async function pull(){
     const h=H(); if(etag) h['If-None-Match']=etag;
     const r=await fetch(api,{headers:h,cache:'no-store'});
     if(r.status===304) return;
-    if(!r.ok){ st('pull '+r.status); return; }
+    if(!r.ok){ st(r.status===404?'gist deleted or wrong id: enter the new id and reconnect':'pull '+r.status); return; }
     etag=r.headers.get('ETag');
     const c=(await r.json()).files['pad.txt']?.content||'';
     let v='';
@@ -97,6 +97,25 @@ $('wipe').onclick=async()=>{
     if(r.ok){ $('t').value=''; synced=''; etag=null; key=salt=null; unlocked=true; st('wiped'); }
     else st('wipe '+r.status);
   }catch{ st('wipe failed'); }
+  busy=false;
+};
+
+// delete the gist (removes all revisions), then create a fresh blank secret gist and switch to it
+$('destroy').onclick=async()=>{
+  if(!api||!confirm('Delete this gist and all its history, and create a fresh one?')) return;
+  clearTimeout(timer); clearInterval(poll); busy=true;
+  try{
+    let r=await fetch(api,{method:'DELETE',headers:H()});
+    if(!r.ok){ st('delete '+r.status); busy=false; poll=setInterval(pull,2000); return; }
+    r=await fetch('https://api.github.com/gists',{method:'POST',headers:{...H(),'Content-Type':'application/json'},
+      body:JSON.stringify({public:false,description:'pad',files:{'pad.txt':{content:' '}}})});
+    if(!r.ok){ st('old gist deleted, but creating a new one failed ('+r.status+')'); busy=false; return; }
+    const id=(await r.json()).id;
+    L.gid=id; $('gid').value=id; api='https://api.github.com/gists/'+id;
+    $('t').value=''; $('t').disabled=false; synced=''; etag=null; key=salt=null; unlocked=true;
+    st('new gist id: '+id+' (enter it on the other machine)');
+    poll=setInterval(pull,2000);
+  }catch{ st('destroy failed'); }
   busy=false;
 };
 </script>
