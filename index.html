@@ -1,51 +1,79 @@
 <!doctype html><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>pad</title>
 <style>
-:root{--bg:#fff;--fg:#111;--bd:#bbb}
-@media(prefers-color-scheme:dark){:root{--bg:#161616;--fg:#e8e8e8;--bd:#444}}
+:root{--bg:#fff;--fg:#111;--bd:#bbb;--hi:#e8f0ff}
+@media(prefers-color-scheme:dark){:root{--bg:#161616;--fg:#e8e8e8;--bd:#444;--hi:#1f2a3d}}
 body{margin:0;font:14px system-ui,sans-serif;background:var(--bg);color:var(--fg)}
 #bar{padding:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 input,button,textarea{font:inherit;color:inherit;background:var(--bg);border:1px solid var(--bd);padding:4px 6px}
-#t{display:block;width:100%;height:calc(100vh - 76px);box-sizing:border-box;border-width:1px 0 0;font:14px ui-monospace,monospace}
+#main{display:flex;height:calc(100vh - 76px);border-top:1px solid var(--bd)}
+#t{flex:1;min-width:0;border:0;font:14px ui-monospace,monospace;resize:none}
+#files{width:280px;border-left:1px solid var(--bd);padding:8px;overflow:auto;display:flex;flex-direction:column;gap:8px}
+#drop{border:2px dashed var(--bd);padding:24px 8px;text-align:center;cursor:pointer}
+#drop.on{background:var(--hi)}
+#out a{word-break:break-all;color:inherit}
+#fst{opacity:.7}
+@media(max-width:700px){#main{flex-direction:column}#files{width:auto;height:40%;border-left:0;border-top:1px solid var(--bd)}}
 </style>
 <div id=bar>
 <input id=tok type=password placeholder=token autocomplete=off>
-<input id=gid placeholder="gist id" autocomplete=off>
+<input id=gid placeholder="pad gist id" autocomplete=off>
+<input id=fid placeholder="files gist id" autocomplete=off>
 <input id=pw type=password placeholder=passphrase autocomplete=off>
 <button id=go>connect</button><button id=wipe>wipe</button><button id=destroy>destroy</button><span id=st></span>
 </div>
+<div id=main>
 <textarea id=t disabled spellcheck=false autocomplete=off></textarea>
+<div id=files>
+<div id=drop>drop a file here<br>or click to choose</div><input id=fi type=file hidden>
+<div id=out></div>
+<div><button id=fnew>new files gist</button> <button id=fclear>clear file</button></div>
+<div id=fst></div>
+</div>
+</div>
 <script>
 const $=id=>document.getElementById(id), L=localStorage, enc=new TextEncoder(), dec=new TextDecoder();
-const BLANK='(empty)'; // gists reject blank/whitespace-only content; any non-encrypted text reads as an empty pad
-const st=m=>{$('st').textContent=m};
-$('tok').value=L.tok||''; $('gid').value=L.gid||'';
+const BLANK='(empty)'; // gists reject blank content; any non-encrypted text reads as "empty"
+const CH=900000, MAXB=3*1048576; // chunk size (chars, stays under GitHub's 1MB per-file API limit) and max file size
+const st=m=>{$('st').textContent=m}, fst=m=>{$('fst').textContent=m};
+const fmt=n=>n<1024?n+' B':n<1048576?(n/1024).toFixed(1)+' KB':(n/1048576).toFixed(2)+' MB';
+$('tok').value=L.tok||''; $('gid').value=L.gid||''; $('fid').value=L.fid||'';
 
 const b64=u=>{let s='';for(let i=0;i<u.length;i+=8192)s+=String.fromCharCode.apply(null,u.subarray(i,i+8192));return btoa(s)};
 const unb64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
 
-let api='', pw='', key=null, salt=null, unlocked=false, etag=null, synced='', timer=null, busy=false, poll=null;
+let api='', fapi='', pw='', key=null, salt=null, unlocked=false, etag=null, fetag=null, synced='';
+let timer=null, busy=false, fbusy=false, poll=null, fpoll=null, fnames=[], url=null;
+const keys=new Map();
 const H=()=>({Authorization:'Bearer '+L.tok, Accept:'application/vnd.github+json'});
+const J=()=>({...H(),'Content-Type':'application/json'});
 
-// passphrase -> AES-GCM key (PBKDF2-SHA256). Passphrase lives in memory only.
-async function derive(s){
-  const base=await crypto.subtle.importKey('raw',enc.encode(pw),'PBKDF2',false,['deriveKey']);
-  return crypto.subtle.deriveKey({name:'PBKDF2',salt:s,iterations:310000,hash:'SHA-256'},
-    base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+// passphrase -> AES-GCM key (PBKDF2-SHA256), cached per salt. Passphrase lives in memory only.
+async function getKey(sl){
+  const id=b64(sl);
+  if(!keys.has(id)){
+    const base=await crypto.subtle.importKey('raw',enc.encode(pw),'PBKDF2',false,['deriveKey']);
+    keys.set(id,await crypto.subtle.deriveKey({name:'PBKDF2',salt:sl,iterations:310000,hash:'SHA-256'},
+      base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']));
+  }
+  return keys.get(id);
 }
-// payload = "v1:" + base64(salt16 | iv12 | ciphertext)
-async function encrypt(txt){
-  if(!key){ salt=crypto.getRandomValues(new Uint8Array(16)); key=await derive(salt); }
+// bytes in -> salt16 | iv12 | ciphertext
+async function encB(u8){
+  if(!key){ salt=crypto.getRandomValues(new Uint8Array(16)); key=await getKey(salt); }
   const iv=crypto.getRandomValues(new Uint8Array(12));
-  const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},key,enc.encode(txt)));
+  const ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv},key,u8));
   const out=new Uint8Array(28+ct.length); out.set(salt); out.set(iv,16); out.set(ct,28);
-  return 'v1:'+b64(out);
+  return out;
 }
-async function decrypt(s){
-  const u=unb64(s.slice(3)), sl=u.slice(0,16);
-  if(!salt||b64(sl)!==b64(salt)){ key=await derive(sl); salt=sl; }
-  return dec.decode(await crypto.subtle.decrypt({name:'AES-GCM',iv:u.slice(16,28)},key,u.slice(28)));
+async function decB(u){
+  const sl=u.slice(0,16), k=await getKey(sl);
+  const out=new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv:u.slice(16,28)},k,u.slice(28)));
+  salt=sl; key=k; return out;
 }
+const encrypt=async t=>'v1:'+b64(await encB(enc.encode(t)));
+const decrypt=async s=>dec.decode(await decB(unb64(s.slice(3))));
 
+/* ---------- pad ---------- */
 async function pull(){
   if(busy) return;
   try{
@@ -64,59 +92,153 @@ async function pull(){
     synced=v; $('t').disabled=false; st('ok');
   }catch{ st('pull failed'); }
 }
-
 async function push(){
   if(!unlocked) return;
   busy=true; const v=$('t').value;
   try{
-    const r=await fetch(api,{method:'PATCH',headers:{...H(),'Content-Type':'application/json'},
+    const r=await fetch(api,{method:'PATCH',headers:J(),
       body:JSON.stringify({files:{'pad.txt':{content:await encrypt(v)}}})});
     if(r.ok){ synced=v; etag=null; st('ok'); } else st('push '+r.status);
   }catch{ st('push failed'); }
   busy=false;
 }
-
 $('t').oninput=()=>{ clearTimeout(timer); timer=setTimeout(push,600); };
 
+/* ---------- files ---------- */
+// stored as gist files d000, d001, ...; d000 starts with "v1:<chunk count>:", then base64(encrypted [4B header len][JSON header][file bytes])
+function show(meta,blob){
+  if(url){ URL.revokeObjectURL(url); url=null; }
+  const o=$('out'); o.textContent='';
+  if(!meta){ o.textContent='no file'; return; }
+  url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download=meta.n; a.textContent='download '+meta.n+' ('+fmt(meta.s)+')';
+  o.append(a);
+}
+async function fpull(){
+  if(!fapi||fbusy) return;
+  try{
+    const h=H(); if(fetag) h['If-None-Match']=fetag;
+    const r=await fetch(fapi,{headers:h,cache:'no-store'});
+    if(r.status===304) return;
+    if(!r.ok){ fst(r.status===404?'files gist deleted or wrong id':'pull '+r.status); return; }
+    fetag=r.headers.get('ETag');
+    const f=(await r.json()).files;
+    fnames=Object.keys(f).filter(k=>/^d\d{3}$/.test(k)).sort();
+    const f0=f[fnames[0]], m=/^v1:(\d+):/.exec(f0?.content||'');
+    if(!m){ show(null); fst('ok'); return; }
+    const n=+m[1]; let s=f0.content.slice(m[0].length);
+    if(f0.truncated){ fst('incomplete (truncated)'); return; }
+    for(let i=1;i<n;i++){
+      const c=f[fnames[i]];
+      if(!c||c.truncated){ fst('incomplete (truncated)'); return; }
+      s+=c.content;
+    }
+    let p; try{ p=await decB(unb64(s)); }catch{ fst('wrong passphrase'); return; }
+    const hl=new DataView(p.buffer).getUint32(0), meta=JSON.parse(dec.decode(p.slice(4,4+hl)));
+    show(meta,new Blob([p.slice(4+hl)],{type:meta.t||'application/octet-stream'}));
+    fst('ok');
+  }catch{ fst('pull failed'); }
+}
+async function sendFile(f){
+  if(!f) return;
+  if(!fapi||!unlocked){ fst('connect first (needs token, pad id, files id, passphrase)'); return; }
+  if(f.size>MAXB){ fst('too big (max '+MAXB/1048576+' MB)'); return; }
+  fbusy=true; fst('encrypting');
+  try{
+    const bytes=new Uint8Array(await f.arrayBuffer()), h=enc.encode(JSON.stringify({n:f.name,t:f.type,s:f.size}));
+    const p=new Uint8Array(4+h.length+bytes.length);
+    new DataView(p.buffer).setUint32(0,h.length); p.set(h,4); p.set(bytes,4+h.length);
+    const s=b64(await encB(p)), n=Math.ceil(s.length/CH), files={};
+    for(let i=0;i<n;i++) files['d'+String(i).padStart(3,'0')]={content:(i?'':'v1:'+n+':')+s.slice(i*CH,(i+1)*CH)};
+    fnames.forEach(k=>{ if(!files[k]) files[k]=null; });   // null deletes stale chunks
+    fst('uploading '+fmt(f.size));
+    const r=await fetch(fapi,{method:'PATCH',headers:J(),body:JSON.stringify({files})});
+    if(r.ok){ fetag=null; fst('sent'); } else fst('upload '+r.status);
+  }catch{ fst('upload failed'); }
+  fbusy=false; fpull();
+}
+const dz=$('drop'), fi=$('fi');
+dz.onclick=()=>fi.click();
+dz.ondragover=e=>{ e.preventDefault(); dz.classList.add('on'); };
+dz.ondragleave=()=>dz.classList.remove('on');
+dz.ondrop=e=>{ e.preventDefault(); dz.classList.remove('on'); sendFile(e.dataTransfer.files[0]); };
+fi.onchange=()=>{ sendFile(fi.files[0]); fi.value=''; };
+
+$('fclear').onclick=async()=>{
+  if(!fapi) return;
+  fbusy=true;
+  const files={d000:{content:BLANK}}; fnames.forEach(k=>{ if(k!=='d000') files[k]=null; });
+  try{
+    const r=await fetch(fapi,{method:'PATCH',headers:J(),body:JSON.stringify({files})});
+    if(r.ok){ fetag=null; fst('cleared'); } else fst('clear '+r.status);
+  }catch{ fst('clear failed'); }
+  fbusy=false; fpull();
+};
+
+/* ---------- gist create / connect / wipe / destroy ---------- */
+const mk=async name=>{
+  const r=await fetch('https://api.github.com/gists',{method:'POST',headers:J(),
+    body:JSON.stringify({public:false,description:'pad',files:{[name]:{content:BLANK}}})});
+  return r.ok?{id:(await r.json()).id}:{err:r.status};
+};
+const del=u=>fetch(u,{method:'DELETE',headers:H()});
+const gurl=id=>'https://api.github.com/gists/'+id;
+
+$('fnew').onclick=async()=>{
+  const t=$('tok').value.trim(); if(!t){ fst('need token'); return; }
+  L.tok=t;
+  try{
+    const a=await mk('d000');
+    if(a.err){ fst('create failed ('+a.err+')'); return; }
+    $('fid').value=a.id; fst('files gist '+a.id+' created: click connect, and enter it on the other machine');
+  }catch{ fst('create failed'); }
+};
+
 $('go').onclick=()=>{
-  L.tok=$('tok').value.trim(); L.gid=$('gid').value.trim(); pw=$('pw').value;
-  if(!L.tok||!L.gid||!pw){ st('need token, gist id, passphrase'); return; }
+  L.tok=$('tok').value.trim(); L.gid=$('gid').value.trim(); L.fid=$('fid').value.trim(); pw=$('pw').value;
+  if(!L.tok||!L.gid||!pw){ st('need token, pad gist id, passphrase'); return; }
   $('pw').value='';
-  clearInterval(poll); clearTimeout(timer);
-  key=salt=null; unlocked=false; etag=null; synced=''; $('t').value=''; busy=false;
-  api='https://api.github.com/gists/'+L.gid;
+  clearInterval(poll); clearInterval(fpoll); clearTimeout(timer);
+  key=salt=null; keys.clear(); unlocked=false; etag=null; fetag=null; synced=''; fnames=[]; $('t').value=''; busy=false; fbusy=false;
+  api=gurl(L.gid); fapi=L.fid?gurl(L.fid):'';
+  show(null); fst(fapi?'':'no files gist id set');
   st('connecting'); pull(); poll=setInterval(pull,2000);
+  if(fapi){ fpull(); fpoll=setInterval(fpull,3000); }
 };
 $('pw').onkeydown=e=>{ if(e.key==='Enter') $('go').click(); };
 
 $('wipe').onclick=async()=>{
-  if(!api||!confirm('Blank the gist and clear the pad?')) return;
+  if(!api||!confirm('Blank the pad gist and clear the pad?')) return;
   clearTimeout(timer); busy=true;
   try{
-    const r=await fetch(api,{method:'PATCH',headers:{...H(),'Content-Type':'application/json'},
-      body:JSON.stringify({files:{'pad.txt':{content:BLANK}}})});   // placeholder text, since gists reject blank content
+    const r=await fetch(api,{method:'PATCH',headers:J(),body:JSON.stringify({files:{'pad.txt':{content:BLANK}}})});
     if(r.ok){ $('t').value=''; synced=''; etag=null; key=salt=null; unlocked=true; st('wiped'); }
     else st('wipe '+r.status);
   }catch{ st('wipe failed'); }
   busy=false;
 };
 
-// delete the gist (removes all revisions), then create a fresh blank secret gist and switch to it
+// delete both gists (removes all revisions), create fresh blank secret ones, switch to them
 $('destroy').onclick=async()=>{
-  if(!api||!confirm('Delete this gist and all its history, and create a fresh one?')) return;
-  clearTimeout(timer); clearInterval(poll); busy=true;
+  if(!api||!confirm('Delete the pad'+(fapi?' and files':'')+' gist(s), including all history, and create fresh ones?')) return;
+  clearTimeout(timer); clearInterval(poll); clearInterval(fpoll); busy=true; fbusy=true;
   try{
-    let r=await fetch(api,{method:'DELETE',headers:H()});
-    if(!r.ok){ st('delete '+r.status); busy=false; poll=setInterval(pull,2000); return; }
-    r=await fetch('https://api.github.com/gists',{method:'POST',headers:{...H(),'Content-Type':'application/json'},
-      body:JSON.stringify({public:false,description:'pad',files:{'pad.txt':{content:BLANK}}})});
-    if(!r.ok){ st('old gist deleted, but creating a new one failed ('+r.status+')'); busy=false; return; }
-    const id=(await r.json()).id;
-    L.gid=id; $('gid').value=id; api='https://api.github.com/gists/'+id;
-    $('t').value=''; $('t').disabled=false; synced=''; etag=null; key=salt=null; unlocked=true;
-    st('new gist id: '+id+' (enter it on the other machine)');
-    poll=setInterval(pull,2000);
+    const r=await del(api);
+    if(!r.ok){ st('delete '+r.status); busy=false; fbusy=false; poll=setInterval(pull,2000); if(fapi) fpoll=setInterval(fpull,3000); return; }
+    if(fapi) await del(fapi);
+    const a=await mk('pad.txt');
+    if(a.err){ st('old gist deleted, but creating a new one failed ('+a.err+')'); busy=false; fbusy=false; return; }
+    L.gid=a.id; $('gid').value=a.id; api=gurl(a.id);
+    let msg='pad gist '+a.id;
+    if(fapi){
+      const b=await mk('d000');
+      if(b.err){ fapi=''; msg+=' (files gist recreate failed: '+b.err+')'; }
+      else{ L.fid=b.id; $('fid').value=b.id; fapi=gurl(b.id); msg+=', files gist '+b.id; }
+    }
+    $('t').value=''; $('t').disabled=false; synced=''; etag=null; fetag=null; fnames=[]; key=salt=null; unlocked=true; show(null);
+    st('new '+msg+' (enter on the other machine)');
+    poll=setInterval(pull,2000); if(fapi) fpoll=setInterval(fpull,3000);
   }catch{ st('destroy failed'); }
-  busy=false;
+  busy=false; fbusy=false;
 };
 </script>
